@@ -1,0 +1,1447 @@
+Explanation of the qa_app
+1. urls.py (Project-level URL Configuration)
+This file defines the top-level URL patterns for the "Mustasharik" Django project. It acts as the entry point for routing HTTP requests to the appropriate apps.
+
+Purpose: Maps URL paths to specific Django apps (app, qa_app, contract_analyzer_app) using the include() function, which delegates URL handling to the respective app's urls.py.
+Key Components:
+path("", include("app.urls")): Routes the root URL (/) to the app application's URL configuration.
+path("qa/", include("qa_app.urls")): Routes URLs starting with /qa/ to the qa_app application's URL configuration.
+path("contract/", include("contract_analyzer_app.urls")): Routes URLs starting with /contract/ to the contract_analyzer_app application's URL configuration.
+
+from datetime import datetime
+from django.urls import path, include
+
+urlpatterns = [
+    path("", include("app.urls")),
+    path("qa/", include("qa_app.urls")),
+    path("contract/", include("contract_analyzer_app.urls")),
+]
+
+
+2. qa_app/urls.py (App-level URL Configuration)
+This file defines URL patterns specific to the qa_app application, which handles question-answering functionality.
+
+Purpose: Maps specific URL paths within the /qa/ namespace to view functions in qa_app.views.
+Key Components:
+app_name = "qa_app": Defines a namespace for the app's URLs to avoid conflicts with other apps.
+path("", views.qa_view, name="qa_view"): Maps /qa/ to the qa_view function, which renders the QA interface.
+path("api/", views.qa_api, name="qa_api"): Maps /qa/api/ to the qa_api function, which handles API requests for answering questions.
+
+from django.urls import path
+from . import views
+app_name = "qa_app"
+urlpatterns = [
+    path("", views.qa_view, name="qa_view"),
+    path("api/", views.qa_api, name="qa_api"),
+]
+
+
+3. qa_app/views.py (View Functions)
+This file contains the view functions that handle HTTP requests and responses for the QA application.
+
+Key Components:
+Logger: Uses Python's logging module to log information and errors.
+QAService: A singleton instance of the QAService class is used to process queries.
+qa_api Function:
+Handles POST requests to /qa/api/.
+Retrieves the query from the request's POST data.
+Calls QAService.answer_question to get an answer and sources.
+Returns a JSON response with the query, answer, and sources, or an error if something fails.
+qa_view Function:
+Handles GET and POST requests to /qa/.
+For GET, renders the question.html template (the QA interface).
+For POST, processes the query using QAService, then renders the template with the query, answer, sources, or an error message.
+
+from django.shortcuts import render
+from django.http import JsonResponse
+from .services import QAService
+import logging
+
+logger = logging.getLogger(__name__)
+qa_service = QAService.get_instance()
+
+# Commit: Add API endpoint for handling question-answering requests via POST, returning JSON with answer and sources.
+def qa_api(request):
+    """API endpoint for QA."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return JsonResponse({"error": "Query is required"}, status=400)
+
+        try:
+            logger.info(f"Processing query: {query}")
+            result = qa_service.answer_question(query)
+            return JsonResponse({
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing API query: {e}", exc_info=True)
+            return JsonResponse({"error": "An error occurred"}, status=500)
+
+    return JsonResponse({"error": "Invalid request method"}, status=405)
+
+# Commit: Add view to render the QA interface, handling both GET (display form) and POST (process query and display results).
+def qa_view(request):
+    """Render the QA interface."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return render(request, "qa_app/question.html", {"error": "يرجى إدخال سؤال"})
+
+        try:
+            result = qa_service.answer_question(query)
+            return render(request, "qa_app/question.html", {
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            return render(request, "qa_app/question.html", {"error": "حدث خطأ أثناء معالجة السؤال"})
+
+    return render(request, "qa_app/question.html")
+
+
+
+4. qa_app/services.py (QAService Class)
+This file implements the QAService class, which handles the core logic for loading documents, creating a vector store, setting up a retriever, and answering questions using a language model.
+
+Key Components:
+Singleton Pattern: Ensures only one instance of QAService exists using __new__ and __init__.
+Document Loading: Loads .docx files from a directory using Docx2txtLoader.
+Vector Store: Uses Chroma to store document embeddings, created with HuggingFaceEmbeddings.
+Retriever: Uses ContextualCompressionRetriever with a cross-encoder reranker to retrieve relevant documents.
+Language Model: Uses ChatGoogleGenerativeAI (Gemini model) to generate answers.
+QA Chain: Combines the retriever and language model with a prompt template to answer questions and provide sources.
+Methods:
+load_documents: Loads .docx files.
+create_vectorstore: Splits documents into chunks and creates a Chroma vector store.
+load_vectorstore: Loads an existing vector store.
+setup_retriever: Configures the retriever with reranking.
+setup_llm: Initializes the language model.
+create_qa_chain: Builds the QA chain.
+_initialize_system: Initializes the system by creating or loading the vector store and setting up the retriever and QA chain.
+answer_question: Processes a query and returns an answer with sources.
+
+import os
+import glob
+import logging
+from langchain_community.document_loaders import Docx2txtLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from django.conf import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Configuration
+DOCUMENTS_DIRECTORY = os.path.join(settings.BASE_DIR, "legal_documents")
+PERSIST_DIRECTORY = os.path.join(settings.BASE_DIR, "chroma_db")
+GOOGLE_API_KEY = settings.GOOGLE_API_KEY
+
+class QAService:
+    _instance = None
+
+    def __new__(cls, force_reinitialize=False):
+        if cls._instance is None:
+            cls._instance = super(QAService, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, force_reinitialize=False):
+        if not self._initialized:
+            self.embeddings = HuggingFaceEmbeddings(model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1")
+            self.qa_chain, self.retriever = self._initialize_system(force_reinitialize)
+            self._initialized = True
+
+    # Commit: Add method to load all .docx files from a specified directory for processing.
+    def load_documents(self, directory):
+        """Load all .docx files from the specified directory."""
+        docs = []
+        for file_path in glob.glob(os.path.join(directory, "*.docx")):
+            try:
+                loader = Docx2txtLoader(file_path)
+                docs.extend(loader.load())
+                logging.info(f"Successfully loaded {file_path}")
+            except Exception as e:
+                logging.error(f"Error loading {file_path}: {e}")
+        if not docs:
+            raise ValueError("No valid Word documents found in the directory.")
+        return docs
+
+    # Commit: Add method to create a Chroma vector store from documents, splitting them into chunks and persisting to disk.
+    def create_vectorstore(self, docs):
+        """Create a Chroma vector store from the provided documents."""
+        splitter = SemanticChunker(self.embeddings)
+        chunks = splitter.split_documents(docs)
+        logging.info("Documents split into chunks successfully.")
+        vectorstore = Chroma.from_documents(chunks, self.embeddings, persist_directory=PERSIST_DIRECTORY)
+        vectorstore.persist()
+        logging.info("Vector store created and persisted.")
+        return vectorstore
+
+    # Commit: Add method to load an existing Chroma vector store from disk for reuse.
+    def load_vectorstore(self):
+        """Load an existing Chroma vector store from disk."""
+        if not os.path.exists(PERSIST_DIRECTORY):
+            raise FileNotFoundError(f"No vector store found at {PERSIST_DIRECTORY}. Please initialize it first.")
+        vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=self.embeddings)
+        logging.info("Vector store loaded from disk.")
+        return vectorstore
+
+    # Commit: Add method to set up a retriever with cross-encoder reranking for improved document relevance.
+    def setup_retriever(self, vectorstore):
+        """Set up the retriever with cross-encoder reranking."""
+        cross_encoder = HuggingFaceCrossEncoder(model_name="Omartificial-Intelligence-Space/ARA-Reranker-V1")
+        compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
+        compression_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor,
+            base_retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
+        )
+        logging.info("Retriever set up with cross-encoder reranking.")
+        return compression_retriever
+
+    # Commit: Add method to initialize the Google Gemini language model for answering questions.
+    def setup_llm(self):
+        """Set up the language model."""
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.7,
+            max_output_tokens=256
+        )
+        logging.info("Language model initialized.")
+        return llm
+
+    # Commit: Add method to create a QA chain with a prompt template and source citation support.
+    def create_qa_chain(self, retriever, llm):
+        """Create the QA chain with citation support."""
+        template = """
+        You are an intelligent assistant that answers questions in clear, concise Arabic.
+        Context: {context}
+        Question: {query}
+        Please cite the source(s) of the information in your response.
+        Answer:
+        """
+        prompt = ChatPromptTemplate.from_template(template)
+        output_parser = StrOutputParser()
+
+        def format_context(docs):
+            """Format context and extract source metadata."""
+            context = "\n\n".join(doc.page_content for doc in docs)
+            sources = [doc.metadata.get('source', 'Unknown') for doc in docs]
+            return {"context": context, "sources": sources}
+
+        qa_chain = (
+            {"context": retriever | format_context, "query": RunnablePassthrough()}
+            | RunnablePassthrough.assign(
+                answer=prompt | llm | output_parser
+            )
+        )
+        logging.info("QA chain created.")
+        return qa_chain
+
+    # Commit: Add method to initialize the QA system, handling vector store creation or loading, retriever setup, and QA chain creation.
+    def _initialize_system(self, force_reinitialize):
+        """Initialize the system by loading or creating the vector store."""
+        if force_reinitialize or not os.path.exists(PERSIST_DIRECTORY):
+            logging.info("Initializing system from scratch...")
+            docs = self.load_documents(DOCUMENTS_DIRECTORY)
+            vectorstore = self.create_vectorstore(docs)
+        else:
+            logging.info("Loading existing vector store...")
+            vectorstore = self.load_vectorstore()
+
+        retriever = self.setup_retriever(vectorstore)
+        llm = self.setup_llm()
+        qa_chain = self.create_qa_chain(retriever, llm)
+        return qa_chain, retriever
+
+    # Commit: Add method to answer a question using the QA chain, returning the answer and sources.
+    def answer_question(self, query):
+        """Answer a question using the QA chain and return answer with sources."""
+        try:
+            result = self.qa_chain.invoke(query)
+            return {
+                "answer": result["answer"],
+                "sources": result["context"]["sources"]
+            }
+        except Exception as e:
+            logging.error(f"Error answering question: {e}", exc_info=True)
+            raise
+
+    @classmethod
+    # Commit: Add class method to retrieve the singleton instance of QAService.
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = QAService()
+        return cls._instance
+
+
+
+5. qa_app/templates/qa_app/question.html (Frontend Template)
+This template defines the QA interface, including a form for submitting queries and a container for displaying results.
+
+Key Components:
+HTML:
+Extends layout.html for consistent styling.
+Contains a form with a textarea for user queries and a submit button.
+Displays results in a results-container div.
+JavaScript:
+Prevents default form submission and uses AJAX to send queries to the /qa/api/ endpoint.
+Displays user queries, answers, and sources in the results-container.
+Includes a toggle button to show/hide sources.
+CSS:
+Styles the results container, user messages, AI responses, errors, and source toggle button.
+
+
+
+Workflow of URLs
+The URL structure in this Django application determines how user requests are routed to the appropriate view functions and processed. Below is the detailed workflow, starting from the base URL:
+
+Base URL (/):
+Routing: The project-level urls.py maps the root URL ("") to include("app.urls"). This delegates all requests to the root path to the app application's URL configuration.
+Behavior: The exact behavior depends on app.urls, which is not provided here. Typically, it would render a homepage or a default view for the application.
+QA URL (/qa/):
+Routing: The project-level urls.py maps /qa/ to include("qa_app.urls"), which delegates to qa_app/urls.py.
+Sub-routes:
+/qa/:
+Maps to qa_view in qa_app.views.
+GET Request: Renders the question.html template, displaying a form where users can input a query.
+POST Request: Processes the query using QAService.answer_question, then re-renders question.html with the query, answer, and sources (or an error if the query is empty or fails).
+/qa/api/:
+Maps to qa_api in qa_app.views.
+POST Request: Expects a query in the POST data, processes it using QAService.answer_question, and returns a JSON response with the query, answer, and sources. If the request method is not POST or the query is empty, it returns an error JSON response.
+Used by: The JavaScript in question.html sends AJAX requests to this endpoint when the form is submitted, allowing dynamic updates to the results container without reloading the page.
+Contract URL (/contract/):
+Routing: The project-level urls.py maps /contract/ to include("contract_analyzer_app.urls"), delegating to the contract_analyzer_app application's URL configuration.
+Behavior: The exact behavior depends on contract_analyzer_app.urls, which is not provided here. It likely handles contract-related functionality.
+Frontend Interaction:
+When a user visits /qa/, the qa_view function renders question.html, showing a form.
+Submitting the form triggers JavaScript in question.html to send an AJAX POST request to /qa/api/ with the query.
+The qa_api view processes the query and returns a JSON response.
+The JavaScript updates the results-container with the user's query, the AI's answer, and a button to toggle the visibility of sources.
+Backend Processing (QAService):
+The QAService singleton initializes by loading .docx files from legal_documents or using an existing Chroma vector store in chroma_db.
+It splits documents into chunks, creates embeddings using HuggingFaceEmbeddings, and stores them in Chroma.
+The retriever uses a cross-encoder reranker to select the top 3 relevant document chunks for a query.
+
+Explanation of the contract_analyzer_app :
+can you explain this codes and make an commit before each method that explain the codes and then explain the flow work of :base url :
+"""
+Definition of urls for Mustasharik.
+"""
+from datetime import datetime
+from django.urls import path, include
+
+urlpatterns = [
+   path("", include("app.urls")),
+    path("qa/", include("qa_app.urls")),
+    path('contract/', include('contract_analyzer_app.urls')),
+]
+
+qa_app.urls file 
+
+from django.urls import path
+from . import views
+app_name = "qa_app"
+urlpatterns = [
+    path("", views.qa_view, name="qa_view"),
+    path("api/", views.qa_api, name="qa_api"),
+]
+
+qa_app view :
+
+from django.shortcuts import render
+from django.http import JsonResponse
+from .services import QAService
+import logging
+
+logger = logging.getLogger(__name__)
+qa_service = QAService.get_instance()
+
+def qa_api(request):
+    """API endpoint for QA."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return JsonResponse({"error": "Query is required"}, status=400)
+
+        try:
+            logger.info(f"Processing query: {query}")
+            result = qa_service.answer_question(query)
+            return JsonResponse({
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing API query: {e}", exc_info=True)
+            return JsonResponse({"error": "An error occurred"}, status=500)
+
+    return JsonResponse({"error": "Invalid request method"}, status=405)
+
+def qa_view(request):
+    """Render the QA interface."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return render(request, "qa_app/question.html", {"error": "يرجى إدخال سؤال"})
+
+        try:
+            result = qa_service.answer_question(query)
+            return render(request, "qa_app/question.html", {
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            return render(request, "qa_app/question.html", {"error": "حدث خطأ أثناء معالجة السؤال"})
+
+    return render(request, "qa_app/question.html")
+
+
+qa_app service.py :
+import os
+import glob
+import logging
+from langchain_community.document_loaders import Docx2txtLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from django.conf import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Configuration
+DOCUMENTS_DIRECTORY = os.path.join(settings.BASE_DIR, "legal_documents")
+PERSIST_DIRECTORY = os.path.join(settings.BASE_DIR, "chroma_db")
+GOOGLE_API_KEY = settings.GOOGLE_API_KEY
+
+class QAService:
+    _instance = None
+
+    def __new__(cls, force_reinitialize=False):
+        if cls._instance is None:
+            cls._instance = super(QAService, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, force_reinitialize=False):
+        if not self._initialized:
+            self.embeddings = HuggingFaceEmbeddings(model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1")
+            self.qa_chain, self.retriever = self._initialize_system(force_reinitialize)
+            self._initialized = True
+
+    def load_documents(self, directory):
+        """Load all .docx files from the specified directory."""
+        docs = []
+        for file_path in glob.glob(os.path.join(directory, "*.docx")):
+            try:
+                loader = Docx2txtLoader(file_path)
+                docs.extend(loader.load())
+                logging.info(f"Successfully loaded {file_path}")
+            except Exception as e:
+                logging.error(f"Error loading {file_path}: {e}")
+        if not docs:
+            raise ValueError("No valid Word documents found in the directory.")
+        return docs
+
+    def create_vectorstore(self, docs):
+        """Create a Chroma vector store from the provided documents."""
+        splitter = SemanticChunker(self.embeddings)
+        chunks = splitter.split_documents(docs)
+        logging.info("Documents split into chunks successfully.")
+        vectorstore = Chroma.from_documents(chunks, self.embeddings, persist_directory=PERSIST_DIRECTORY)
+        vectorstore.persist()
+        logging.info("Vector store created and persisted.")
+        return vectorstore
+
+    def load_vectorstore(self):
+        """Load an existing Chroma vector store from disk."""
+        if not os.path.exists(PERSIST_DIRECTORY):
+            raise FileNotFoundError(f"No vector store found at {PERSIST_DIRECTORY}. Please initialize it first.")
+        vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=self.embeddings)
+        logging.info("Vector store loaded from disk.")
+        return vectorstore
+
+    def setup_retriever(self, vectorstore):
+        """Set up the retriever with cross-encoder reranking."""
+        cross_encoder = HuggingFaceCrossEncoder(model_name="Omartificial-Intelligence-Space/ARA-Reranker-V1")
+        compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
+        compression_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor,
+            base_retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
+        )
+        logging.info("Retriever set up with cross-encoder reranking.")
+        return compression_retriever
+
+    def setup_llm(self):
+        """Set up the language model."""
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.7,
+            max_output_tokens=256
+        )
+        logging.info("Language model initialized.")
+        return llm
+
+    def create_qa_chain(self, retriever, llm):
+        """Create the QA chain with citation support."""
+        template = """
+        You are an intelligent assistant that answers questions in clear, concise Arabic.
+        Context: {context}
+        Question: {query}
+        Please cite the source(s) of the information in your response.
+        Answer:
+        """
+        prompt = ChatPromptTemplate.from_template(template)
+        output_parser = StrOutputParser()
+
+        def format_context(docs):
+            """Format context and extract source metadata."""
+            context = "\n\n".join(doc.page_content for doc in docs)
+            sources = [doc.metadata.get('source', 'Unknown') for doc in docs]
+            return {"context": context, "sources": sources}
+
+        qa_chain = (
+            {"context": retriever | format_context, "query": RunnablePassthrough()}
+            | RunnablePassthrough.assign(
+                answer=prompt | llm | output_parser
+            )
+        )
+        logging.info("QA chain created.")
+        return qa_chain
+
+    def _initialize_system(self, force_reinitialize):
+        """Initialize the system by loading or creating the vector store."""
+        if force_reinitialize or not os.path.exists(PERSIST_DIRECTORY):
+            logging.info("Initializing system from scratch...")
+            docs = self.load_documents(DOCUMENTS_DIRECTORY)
+            vectorstore = self.create_vectorstore(docs)
+        else:
+            logging.info("Loading existing vector store...")
+            vectorstore = self.load_vectorstore()
+
+        retriever = self.setup_retriever(vectorstore)
+        llm = self.setup_llm()
+        qa_chain = self.create_qa_chain(retriever, llm)
+        return qa_chain, retriever
+
+    def answer_question(self, query):
+        """Answer a question using the QA chain and return answer with sources."""
+        try:
+            result = self.qa_chain.invoke(query)
+            return {
+                "answer": result["answer"],
+                "sources": result["context"]["sources"]
+            }
+        except Exception as e:
+            logging.error(f"Error answering question: {e}", exc_info=True)
+            raise
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = QAService()
+        return cls._instance
+
+
+qa_app question.html :
+{% extends "layout.html" %}
+{% load static %}
+
+{% block content %}
+<div class="container contract-page mt-5">
+    <div class="row">
+        <div class="col-md-5 p-2 bd-highlight">
+            <form id="chat-form" method="post" enctype="multipart/form-data">
+                {% csrf_token %}
+                <div class="mb-5">
+                    <textarea id="chat-input" name="query" class="form-control" placeholder="اكتب استفسارك هنا ..." rows="8"></textarea>
+                </div>
+                <div class="mb-3">
+                    <button type="submit" class="btn btn-md btn-primary main-btn w-100">ارسال</button>
+                </div>
+            </form>
+        </div>
+        <div class="col-md-7 d-flex flex-column my-2 px-2">
+            <div id="results-container" class="results-container p-3 ms-md-5 flex-grow-1 text-black-50 bd-highlight">
+                <!-- Chat messages will appear here -->
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.getElementById('chat-form').addEventListener('submit', function (e) {
+        e.preventDefault(); // Prevent form submission
+
+        const userInput = document.getElementById('chat-input').value.trim();
+        const resultsContainer = document.getElementById('results-container');
+
+        if (!userInput) {
+            resultsContainer.innerHTML += '<div class="error">يرجى إدخال سؤال</div>';
+            resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            return;
+        }
+
+        // Add user's message to the results container
+        resultsContainer.innerHTML += `<div class="user-message">${userInput}</div>`;
+
+        // Clear the input field
+        document.getElementById('chat-input').value = '';
+
+        // Show loading indicator
+        const loadingDiv = document.createElement('div');
+        loadingDiv.id = 'loading';
+        loadingDiv.innerText = 'جاري المعالجة...';
+        resultsContainer.appendChild(loadingDiv);
+        resultsContainer.scrollTop = resultsContainer.scrollHeight;
+
+        // Send AJAX request
+        fetch('{% url "qa_app:qa_api" %}', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-CSRFToken': document.querySelector('input[name=csrfmiddlewaretoken]').value
+            },
+            body: `query=${encodeURIComponent(userInput)}`
+        })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Remove loading indicator
+                loadingDiv.remove();
+
+                if (data.answer) {
+                    // Create a unique ID for this answer's sources
+                    const sourceId = 'sources-' + Date.now();
+                    // Add answer with a button to show sources
+                    resultsContainer.innerHTML += `
+                        <div class="gpt-response">
+                            ${data.answer}
+                            <button class="source-btn" data-source-id="${sourceId}">عرض المصادر</button>
+                            <div class="sources" id="${sourceId}" style="display: none;">
+                                ${data.sources && data.sources.length > 0
+                            ? data.sources.map(source => `<div>${source}</div>`).join('')
+                            : '<div>لا توجد مصادر متاحة</div>'}
+                            </div>
+                        </div>`;
+
+                    // Add event listener for the source button
+                    document.querySelector(`button[data-source-id="${sourceId}"]`).addEventListener('click', function () {
+                        const sourceDiv = document.getElementById(sourceId);
+                        sourceDiv.style.display = sourceDiv.style.display === 'none' ? 'block' : 'none';
+                    });
+                } else {
+                    resultsContainer.innerHTML += '<div class="error">خطأ: تعذر الحصول على إجابة</div>';
+                }
+                // Scroll to the bottom
+                resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            })
+            .catch(error => {
+                // Remove loading indicator
+                loadingDiv.remove();
+
+                console.error('Error:', error);
+                resultsContainer.innerHTML += `<div class="error">خطأ في الاتصال بالخادم: ${error.message}</div>`;
+                resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            });
+    });
+</script>
+
+<style>
+    .results-container {
+        max-height: 400px;
+        overflow-y: auto;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+    }
+
+    .user-message {
+        background-color: #e1f5fe;
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+        text-align: right;
+    }
+
+    .gpt-response {
+        background-color: #f0f0f0;
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+        text-align: right;
+    }
+
+    .error {
+        color: red;
+        padding: 10px;
+        margin: 5px;
+        text-align: right;
+    }
+
+    #loading {
+        color: #888;
+        padding: 10px;
+        margin: 5px;
+        text-align: center;
+    }
+
+    .source-btn {
+        background-color: #007bff;
+        color: white;
+        border: none;
+        padding: 5px 10px;
+        margin-top: 10px;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 14px;
+    }
+
+        .source-btn:hover {
+            background-color: #0056b3;
+        }
+
+    .sources {
+        background-color: #ffffff;
+        border: 1px solid #ddd;
+        padding: 10px;
+        margin-top: 10px;
+        border-radius: 3px;
+        text-align: right;
+    }
+</style>
+{% endblock %}
+
+
+I'll explain the codebase, add commit messages before each method, and describe the workflow, focusing on how URLs are handled. The code is a Django-based question-answering (QA) application that processes queries against legal documents and returns answers with sources. Below, I'll break down each file, add commit messages to methods, explain their purpose, and then describe the URL workflow.
+
+Explanation of the Codebase
+1. urls.py (Project-level URL Configuration)
+This file defines the top-level URL patterns for the "Mustasharik" Django project. It acts as the entry point for routing HTTP requests to the appropriate apps.
+
+Purpose: Maps URL paths to specific Django apps (app, qa_app, contract_analyzer_app) using the include() function, which delegates URL handling to the respective app's urls.py.
+Key Components:
+path("", include("app.urls")): Routes the root URL (/) to the app application's URL configuration.
+path("qa/", include("qa_app.urls")): Routes URLs starting with /qa/ to the qa_app application's URL configuration.
+path("contract/", include("contract_analyzer_app.urls")): Routes URLs starting with /contract/ to the contract_analyzer_app application's URL configuration.
+urls.py
+python
+عرض مضمَّن
+2. qa_app/urls.py (App-level URL Configuration)
+This file defines URL patterns specific to the qa_app application, which handles question-answering functionality.
+
+Purpose: Maps specific URL paths within the /qa/ namespace to view functions in qa_app.views.
+Key Components:
+app_name = "qa_app": Defines a namespace for the app's URLs to avoid conflicts with other apps.
+path("", views.qa_view, name="qa_view"): Maps /qa/ to the qa_view function, which renders the QA interface.
+path("api/", views.qa_api, name="qa_api"): Maps /qa/api/ to the qa_api function, which handles API requests for answering questions.
+qa_app/urls.py
+python
+عرض مضمَّن
+3. qa_app/views.py (View Functions)
+This file contains the view functions that handle HTTP requests and responses for the QA application.
+
+Key Components:
+Logger: Uses Python's logging module to log information and errors.
+QAService: A singleton instance of the QAService class is used to process queries.
+qa_api Function:
+Handles POST requests to /qa/api/.
+Retrieves the query from the request's POST data.
+Calls QAService.answer_question to get an answer and sources.
+Returns a JSON response with the query, answer, and sources, or an error if something fails.
+qa_view Function:
+Handles GET and POST requests to /qa/.
+For GET, renders the question.html template (the QA interface).
+For POST, processes the query using QAService, then renders the template with the query, answer, sources, or an error message.
+qa_app/views.py
+python
+عرض مضمَّن
+4. qa_app/services.py (QAService Class)
+This file implements the QAService class, which handles the core logic for loading documents, creating a vector store, setting up a retriever, and answering questions using a language model.
+
+Key Components:
+Singleton Pattern: Ensures only one instance of QAService exists using __new__ and __init__.
+Document Loading: Loads .docx files from a directory using Docx2txtLoader.
+Vector Store: Uses Chroma to store document embeddings, created with HuggingFaceEmbeddings.
+Retriever: Uses ContextualCompressionRetriever with a cross-encoder reranker to retrieve relevant documents.
+Language Model: Uses ChatGoogleGenerativeAI (Gemini model) to generate answers.
+QA Chain: Combines the retriever and language model with a prompt template to answer questions and provide sources.
+Methods:
+load_documents: Loads .docx files.
+create_vectorstore: Splits documents into chunks and creates a Chroma vector store.
+load_vectorstore: Loads an existing vector store.
+setup_retriever: Configures the retriever with reranking.
+setup_llm: Initializes the language model.
+create_qa_chain: Builds the QA chain.
+_initialize_system: Initializes the system by creating or loading the vector store and setting up the retriever and QA chain.
+answer_question: Processes a query and returns an answer with sources.
+qa_app/services.py
+python
+عرض مضمَّن
+5. qa_app/templates/qa_app/question.html (Frontend Template)
+This template defines the QA interface, including a form for submitting queries and a container for displaying results.
+
+Key Components:
+HTML:
+Extends layout.html for consistent styling.
+Contains a form with a textarea for user queries and a submit button.
+Displays results in a results-container div.
+JavaScript:
+Prevents default form submission and uses AJAX to send queries to the /qa/api/ endpoint.
+Displays user queries, answers, and sources in the results-container.
+Includes a toggle button to show/hide sources.
+CSS:
+Styles the results container, user messages, AI responses, errors, and source toggle button.
+qa_app/templates/qa_app/question.html
+html
+عرض مضمَّن
+Workflow of URLs
+The URL structure in this Django application determines how user requests are routed to the appropriate view functions and processed. Below is the detailed workflow, starting from the base URL:
+
+Base URL (/):
+Routing: The project-level urls.py maps the root URL ("") to include("app.urls"). This delegates all requests to the root path to the app application's URL configuration.
+Behavior: The exact behavior depends on app.urls, which is not provided here. Typically, it would render a homepage or a default view for the application.
+QA URL (/qa/):
+Routing: The project-level urls.py maps /qa/ to include("qa_app.urls"), which delegates to qa_app/urls.py.
+Sub-routes:
+/qa/:
+Maps to qa_view in qa_app.views.
+GET Request: Renders the question.html template, displaying a form where users can input a query.
+POST Request: Processes the query using QAService.answer_question, then re-renders question.html with the query, answer, and sources (or an error if the query is empty or fails).
+/qa/api/:
+Maps to qa_api in qa_app.views.
+POST Request: Expects a query in the POST data, processes it using QAService.answer_question, and returns a JSON response with the query, answer, and sources. If the request method is not POST or the query is empty, it returns an error JSON response.
+Used by: The JavaScript in question.html sends AJAX requests to this endpoint when the form is submitted, allowing dynamic updates to the results container without reloading the page.
+Contract URL (/contract/):
+Routing: The project-level urls.py maps /contract/ to include("contract_analyzer_app.urls"), delegating to the contract_analyzer_app application's URL configuration.
+Behavior: The exact behavior depends on contract_analyzer_app.urls, which is not provided here. It likely handles contract-related functionality.
+Frontend Interaction:
+When a user visits /qa/, the qa_view function renders question.html, showing a form.
+Submitting the form triggers JavaScript in question.html to send an AJAX POST request to /qa/api/ with the query.
+The qa_api view processes the query and returns a JSON response.
+The JavaScript updates the results-container with the user's query, the AI's answer, and a button to toggle the visibility of sources.
+Backend Processing (QAService):
+The QAService singleton initializes by loading .docx files from legal_documents or using an existing Chroma vector store in chroma_db.
+It splits documents into chunks, creates embeddings using HuggingFaceEmbeddings, and stores them in Chroma.
+The retriever uses a cross-encoder reranker to select the top 3 relevant document chunks for a query.
+The QA chain combines the retrieved context with the query, passes it to the Gemini language model, and formats the response with sources.
+URL Workflow Diagram
+text
+
+User Request
+  |
+  v
+[Base URL: /] ----> urls.py
+  |                   |
+  |                   v
+  |                 include("app.urls") --> [app.urls]
+  |
+  v
+[/qa/] -----------> include("qa_app.urls") --> qa_app/urls.py
+  |                                           |
+  |                                           v
+  |                                         [/] --> qa_view (GET: render question.html, POST: process query)
+  |                                         [/api/] --> qa_api (POST: return JSON with answer and sources)
+  |
+  v
+[/contract/] -----> include("contract_analyzer_app.urls") --> [contract_analyzer_app.urls]
+Summary
+URLs: The project routes / to app, /qa/ to qa_app, and /contract/ to contract_analyzer_app. Within qa_app, /qa/ handles the UI, and /qa/api/ handles API requests.
+Frontend: question.html provides a form and uses AJAX to interact with /qa/api/, dynamically displaying queries, answers, and sources.
+Backend: QAService processes queries by retrieving relevant document chunks and generating answers with the Gemini model, ensuring sources are included.
+Flow: A user visits /qa/, submits a query via the form, which triggers an AJAX call to /qa/api/. The backend processes the query and returns a response, which the frontend displays.
+This structure ensures a modular, scalable QA system with clear separation of concerns between URL routing, view logic, service processing, and frontend interaction.
+
+
+
+
+
+
+
+also for this :
+contract_analyzer_app urls file: 
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.upload_pdf, name='contract-view'),
+]
+
+
+contract_analyzer_app view ,py:
+
+from django.shortcuts import render
+from django.conf import settings
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+from django.http import JsonResponse
+import os
+from .services import process_pdf_and_analyze_clauses
+
+def upload_pdf(request):
+    """Handle PDF upload and return clause analysis as JSON."""
+    # print(f"Request method: {request.method}")
+    # print(f"FILES: {request.FILES}")
+    # print(f"POST data: {request.POST}")
+    
+    if request.method == 'POST' and request.FILES.get('contractFile'):
+        pdf_file = request.FILES['contractFile']
+        contract_type = request.POST.get('contract-type', 'ambiguous_contract')
+        # print(f"Received file: {pdf_file.name}")
+        # print(f"Contract type: {contract_type}")
+        
+        # Validate file type
+        if not pdf_file.content_type == 'application/pdf':
+            return JsonResponse(
+                {"error": "الملف غير مدعوم", "details": "يرجى رفع ملف بصيغة PDF"},
+                status=400,
+                json_dumps_params={'ensure_ascii': False}
+            )
+        
+        # Save the uploaded PDF temporarily
+        file_path = default_storage.save('temp.pdf', ContentFile(pdf_file.read()))
+        full_path = os.path.join(settings.MEDIA_ROOT, file_path)
+        # print(f"Saved PDF to: {full_path}")
+        
+        try:
+            # Process PDF and get clause analysis
+            clauses = process_pdf_and_analyze_clauses(full_path, contract_type)
+            # print(f"Clauses: {clauses}")
+            # Return JSON response
+            return JsonResponse(
+                {"clauses": clauses},
+                json_dumps_params={'ensure_ascii': False}
+            )
+        except Exception as e:
+            print(f"Error processing PDF: {e}")
+            return JsonResponse(
+                {"error": "فشل في معالجة الملف", "details": str(e)},
+                status=500,
+                json_dumps_params={'ensure_ascii': False}
+            )
+        finally:
+            # Clean up temporary file
+            if os.path.exists(full_path):
+                print(f"Cleaning up: {full_path}")
+                os.remove(full_path)
+    
+    # For GET requests or invalid POST, render the form
+    return render(request, 'contract_analyzer_app/contract.html')
+
+contract_analyzer_app services :
+import google.generativeai as genai
+from django.conf import settings
+import json
+import re
+from datetime import datetime
+
+# Configure Gemini API
+genai.configure(api_key=settings.GOOGLE_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+def extract_text_with_gemini(pdf_path):
+    """Extract text from a PDF using Gemini."""
+    print(f"Extracting text from: {pdf_path}")
+    pdf_file = genai.upload_file(path=pdf_path, mime_type="application/pdf")
+    prompt = (
+        "Extract all text from this PDF, including Arabic, English, numbers, and symbols like %. "
+        "Ensure dates are extracted accurately in the format DD-MM-YYYY. "
+        "Return the text as-is, preserving the original content."
+    )
+    response = model.generate_content([pdf_file, prompt])
+    extracted_text = response.text.strip()
+    genai.delete_file(pdf_file.name)
+    return extracted_text
+
+def process_pdf_with_gemini(pdf_path):
+    """Process PDF and extract text using Gemini."""
+    extracted_text = extract_text_with_gemini(pdf_path)
+    result = f"Extracted Text:\n{extracted_text}\n"
+    return result
+
+def extract_contract_clauses(contract_text):
+    """Extract contract clauses using Gemini."""
+    prompt = f"""
+        قم باستخراج جميع بنود العقد من النص التالي. تأكد من اتباع التعليمات التالية بدقة:
+
+        1. استخرج فقط النصوص التي تمثل بنودًا في العقد.
+        2. تجاهل أي نص غير متعلق بالبنود، مثل العناوين، الترويسات، الأرقام، التواقيع، أو أي نص غير ذي صلة.
+        3. لكل بند، قم بتقديمه بالتنسيق التالي:
+           بند رقم X: [نص البند كما هو في العقد]
+        4. حافظ على التسلسل الأصلي للبنود كما وردت في النص.
+        5. إذا كان النص يحتوي على فقرات غير واضحة كبنود، قم بتجاهلها إلا إذا كانت تحتوي على مصطلحات مثل "يلتزم"، "يتعهد"، "يحق"، أو أي مصطلحات قانونية تشير إلى أنها بند.
+        6. تحقق من صحة التواريخ في البنود (مثل أن تكون تواريخ النهاية بعد تواريخ البداية) 
+        النص:
+        {contract_text}
+
+        المخرجات المتوقعة:
+        - قائمة بجميع بنود العقد، مرقمة ومصاغة كما هي في النص الأصلي.
+        - لا تقم بإضافة أي تفسيرات أو تعديلات على النص.
+    """
+    response = model.generate_content(prompt)
+    clauses = response.text.strip()
+    return clauses
+
+def correct_dates_in_text(text):
+    date_pattern = re.compile(r"\d{2}-\d{2}-\d{4}")
+    dates = date_pattern.findall(text)
+    corrected_text = text
+    for date_str in dates:
+        try:
+            datetime.strptime(date_str, "%d-%m-%Y")
+        except ValueError:
+            print(f"Suspicious or invalid date format found: {date_str}")
+            # Optionally log or highlight for manual review
+    return corrected_text
+
+def analyze_contract_with_gemini(clauses):
+    """Analyze contract for ambiguous clauses and return structured JSON data directly."""
+    prompt = f"""
+        قم بتحليل العقد التالي وتحديد البنود الغامضة فيه.
+        
+        النص:
+        {clauses}
+
+        المطلوب:
+        - قم بإرجاع نتائج التحليل بصيغة JSON فقط، دون أي نصوص إضافية.
+        - لكل بند غامض، أدرج:
+          - "clause": نص البند كما هو.
+          - "problem": سبب الغموض.
+          - "recommendation": اقتراح لإعادة صياغته.
+        - تحقق من التواريخ للتأكد من أنها منطقية (مثل أن تكون تواريخ النهاية بعد تواريخ البداية).
+
+        مثال على التنسيق:
+        [
+            {{
+                "clause": "الطرف الأول يلتزم بتوفير الخدمة حسب الظروف المتاحة.",
+                "problem": "غير واضح ما المقصود بـ'الظروف المتاحة'.",
+                "recommendation": "يُحدد نطاق الخدمات ومدى توافرها بدقة."
+            }}
+        ]
+
+        إذا لم توجد بنود غامضة، أعد JSON فارغة مثل: []
+    """
+    try:
+        generation_config = genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.2
+        )
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        analysis_json = response.text.strip()
+        parsed_clauses = json.loads(analysis_json)
+        return parsed_clauses
+    except Exception as e:
+        print(f"Gemini API error or invalid JSON: {e}")
+        return []
+
+def analyze_contradictory_clauses_with_gemini(clauses):
+    """Analyze contract for contradictory clauses and return structured JSON data directly."""
+    print(f"Analyzing contradictory clauses: {clauses}")
+    prompt = f"""
+        قم بتحليل العقد التالي وتحديد البنود المتناقضة فيه.
+
+        النص:
+        {clauses}
+
+        المطلوب:
+        - قم بإرجاع نتائج التحليل بصيغة JSON فقط، دون أي نصوص إضافية.
+        - لكل مجموعة من البنود المتناقضة، أدرج:
+          - "clause1": نص البند الأول كما هو.
+          - "clause2": نص البند الثاني كما هو (أو فارغ إذا كان التناقض مع نص خارجي).
+          - "contradiction": شرح التناقض بين البندين (أو بين البند ونص خارجي).
+          - "recommendation": اقتراح لتسوية التناقض.
+        - ركز على التناقضات مثل الالتزامات المتناقضة، الحقوق المتباينة، أو الشروط المعارضة.
+        - تحقق من التواريخ للتأكد من أنها منطقية (مثل أن تكون تواريخ النهاية بعد تواريخ البداية). إذا تم العثور على تاريخ غير منطقي، قم بتضمينه كجزء من التناقض.
+
+        مثال على التنسيق:
+        [
+            {{
+                "clause1": "الطرف الأول يلتزم بتسليم العمل خلال 30 يومًا.",
+                "clause2": "الطرف الأول يلتزم بتسليم العمل خلال 60 يومًا.",
+                "contradiction": "البندان يحددان فترتين مختلفتين لتسليم العمل.",
+                "recommendation": "توحيد المدة إلى فترة واحدة، مثل: 'الطرف الأول يلتزم بتسليم العمل خلال 45 يومًا.'"
+            }}
+        ]
+
+        إذا لم توجد بنود متناقضة، أعد JSON فارغة مثل: []
+    """
+    try:
+        generation_config = {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        analysis_json = response.text.strip()
+        parsed_clauses = json.loads(analysis_json)
+        return parsed_clauses
+    except Exception as e:
+        print(f"Gemini API error or invalid JSON for contradictory analysis: {e}")
+        return []
+
+def process_pdf_and_analyze_clauses(pdf_path, contract_type='ambiguous_contract'):
+    """Process PDF and return clause analysis based on contract type."""
+    extracted_text = process_pdf_with_gemini(pdf_path)
+    extracted_text=correct_dates_in_text(extracted_text)
+    clauses = extract_contract_clauses(extracted_text)
+    if contract_type == 'ambiguous_contract':
+        return analyze_contract_with_gemini(clauses)
+    elif contract_type == 'Contradictory_contract':
+        return analyze_contradictory_clauses_with_gemini(clauses)
+    else:
+        print(f"Invalid contract type: {contract_type}")
+        return []
+
+
+
+
+Explanation of the contract_analyzer_app
+
+1. contract_analyzer_app/urls.py (App-level URL Configuration)
+This file defines the URL patterns for the contract_analyzer_app, which handles PDF-based contract analysis.
+
+Purpose: Maps the root URL (/contract/) to the upload_pdf view function in contract_analyzer_app.views.
+Key Components:
+path('', views.upload_pdf, name='contract-view'): Routes /contract/ to the upload_pdf function, which handles both GET requests (rendering the upload form) and POST requests (processing uploaded PDFs).
+
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.upload_pdf, name='contract-view'),
+]
+
+
+
+2. contract_analyzer_app/views.py (View Functions)
+This file contains the upload_pdf view function, which processes PDF uploads and returns clause analysis results.
+
+Purpose: Handles GET requests to render the upload form and POST requests to process uploaded PDFs, validate their format, save them temporarily, analyze clauses, and return results as JSON.
+Key Components:
+File Validation: Ensures the uploaded file is a PDF.
+File Storage: Saves the PDF temporarily using Django's default_storage.
+Clause Analysis: Calls process_pdf_and_analyze_clauses to extract and analyze clauses based on the contract type.
+Response: Returns JSON with analysis results or errors, with proper Arabic encoding.
+Cleanup: Deletes the temporary PDF file after processing.
+GET Handling: Renders the contract.html template for the upload form.
+
+from django.shortcuts import render
+from django.conf import settings
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+from django.http import JsonResponse
+import os
+from .services import process_pdf_and_analyze_clauses
+
+# Commit: Add view to handle PDF uploads for contract analysis, validate file type, process clauses, and return JSON results or render the upload form.
+def upload_pdf(request):
+    """Handle PDF upload and return clause analysis as JSON."""
+    # print(f"Request method: {request.method}")
+    # print(f"FILES: {request.FILES}")
+    # print(f"POST data: {request.POST}")
+    
+    if request.method == 'POST' and request.FILES.get('contractFile'):
+        pdf_file = request.FILES['contractFile']
+        contract_type = request.POST.get('contract-type', 'ambiguous_contract')
+        # print(f"Received file: {pdf_file.name}")
+        # print(f"Contract type: {contract_type}")
+        
+        # Validate file type
+        if not pdf_file.content_type == 'application/pdf':
+            return JsonResponse(
+                {"error": "الملف غير مدعوم", "details": "يرجى رفع ملف بصيغة PDF"},
+                status=400,
+                json_dumps_params={'ensure_ascii': False}
+            )
+        
+        # Save the uploaded PDF temporarily
+        file_path = default_storage.save('temp.pdf', ContentFile(pdf_file.read()))
+        full_path = os.path.join(settings.MEDIA_ROOT, file_path)
+        # print(f"Saved PDF to: {full_path}")
+        
+        try:
+            # Process PDF and get clause analysis
+            clauses = process_pdf_and_analyze_clauses(full_path, contract_type)
+            # print(f"Clauses: {clauses}")
+            # Return JSON response
+            return JsonResponse(
+                {"clauses": clauses},
+                json_dumps_params={'ensure_ascii': False}
+            )
+        except Exception as e:
+            print(f"Error processing PDF: {e}")
+            return JsonResponse(
+                {"error": "فشل في معالجة الملف", "details": str(e)},
+                status=500,
+                json_dumps_params={'ensure_ascii': False}
+            )
+        finally:
+            # Clean up temporary file
+            if os.path.exists(full_path):
+                print(f"Cleaning up: {full_path}")
+                os.remove(full_path)
+    
+    # For GET requests or invalid POST, render the form
+    return render(request, 'contract_analyzer_app/contract.html')
+
+
+3. contract_analyzer_app/services.py (Service Functions)
+This file contains functions for processing PDFs and analyzing contract clauses using the Gemini API.
+
+Purpose: Extracts text from PDFs, identifies contract clauses, and analyzes them for ambiguity or contradictions, returning structured JSON results.
+Key Components:
+Gemini Configuration: Uses the gemini-1.5-flash model with the Google API key from Django settings.
+Methods:
+extract_text_with_gemini: Uploads a PDF to Gemini, extracts text (including Arabic, English, numbers, and dates), and deletes the uploaded file.
+process_pdf_with_gemini: Calls extract_text_with_gemini and formats the extracted text.
+extract_contract_clauses: Uses Gemini to extract clauses from the text, formatting them as "بند رقم X: [clause text]".
+correct_dates_in_text: Validates dates in the text using a regex pattern and logs suspicious formats.
+analyze_contract_with_gemini: Analyzes clauses for ambiguity, returning JSON with clause text, problem, and recommendation.
+analyze_contradictory_clauses_with_gemini: Analyzes clauses for contradictions, returning JSON with conflicting clauses, contradiction explanation, and recommendation.
+process_pdf_and_analyze_clauses: Orchestrates the process by extracting text, correcting dates, extracting clauses, and analyzing based on the contract type (ambiguous_contract or Contradictory_contract).
+
+
+import google.generativeai as genai
+from django.conf import settings
+import json
+import re
+from datetime import datetime
+
+# Configure Gemini API
+genai.configure(api_key=settings.GOOGLE_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Commit: Add function to extract text from a PDF using Gemini, preserving Arabic, English, numbers, and dates.
+def extract_text_with_gemini(pdf_path):
+    """Extract text from a PDF using Gemini."""
+    print(f"Extracting text from: {pdf_path}")
+    pdf_file = genai.upload_file(path=pdf_path, mime_type="application/pdf")
+    prompt = (
+        "Extract all text from this PDF, including Arabic, English, numbers, and symbols like %. "
+        "Ensure dates are extracted accurately in the format DD-MM-YYYY. "
+        "Return the text as-is, preserving the original content."
+    )
+    response = model.generate_content([pdf_file, prompt])
+    extracted_text = response.text.strip()
+    genai.delete_file(pdf_file.name)
+    return extracted_text
+
+# Commit: Add function to process a PDF and extract its text using Gemini, formatting the result for further analysis.
+def process_pdf_with_gemini(pdf_path):
+    """Process PDF and extract text using Gemini."""
+    extracted_text = extract_text_with_gemini(pdf_path)
+    result = f"Extracted Text:\n{extracted_text}\n"
+    return result
+
+# Commit: Add function to extract contract clauses from text using Gemini, formatting them as numbered clauses.
+def extract_contract_clauses(contract_text):
+    """Extract contract clauses using Gemini."""
+    prompt = f"""
+        قم باستخراج جميع بنود العقد من النص التالي. تأكد من اتباع التعليمات التالية بدقة:
+
+        1. استخرج فقط النصوص التي تمثل بنودًا في العقد.
+        2. تجاهل أي نص غير متعلق بالبنود، مثل العناوين، الترويسات، الأرقام، التواقيع، أو أي نص غير ذي صلة.
+        3. لكل بند، قم بتقديمه بالتنسيق التالي:
+           بند رقم X: [نص البند كما هو في العقد]
+        4. حافظ على التسلسل الأصلي للبنود كما وردت في النص.
+        5. إذا كان النص يحتوي على فقرات غير واضحة كبنود، قم بتجاهلها إلا إذا كانت تحتوي على مصطلحات مثل "يلتزم"، "يتعهد"، "يحق"، أو أي مصطلحات قانونية تشير إلى أنها بند.
+        6. تحقق من صحة التواريخ في البنود (مثل أن تكون تواريخ النهاية بعد تواريخ البداية) 
+        النص:
+        {contract_text}
+
+        المخرجات المتوقعة:
+        - قائمة بجميع بنود العقد، مرقمة ومصاغة كما هي في النص الأصلي.
+        - لا تقم بإضافة أي تفسيرات أو تعديلات على النص.
+    """
+    response = model.generate_content(prompt)
+    clauses = response.text.strip()
+    return clauses
+
+# Commit: Add function to validate and correct date formats in extracted text, logging suspicious dates.
+def correct_dates_in_text(text):
+    """Correct dates in text and validate their format."""
+    date_pattern = re.compile(r"\d{2}-\d{2}-\d{4}")
+    dates = date_pattern.findall(text)
+    corrected_text = text
+    for date_str in dates:
+        try:
+            datetime.strptime(date_str, "%d-%m-%Y")
+        except ValueError:
+            print(f"Suspicious or invalid date format found: {date_str}")
+            # Optionally log or highlight for manual review
+    return corrected_text
+
+# Commit: Add function to analyze contract clauses for ambiguity using Gemini, returning JSON with clause details, problems, and recommendations.
+def analyze_contract_with_gemini(clauses):
+    """Analyze contract for ambiguous clauses and return structured JSON data directly."""
+    prompt = f"""
+        قم بتحليل العقد التالي وتحديد البنود الغامضة فيه.
+        
+        النص:
+        {clauses}
+
+        المطلوب:
+        - قم بإرجاع نتائج التحليل بصيغة JSON فقط، دون أي نصوص إضافية.
+        - لكل بند غامض، أدرج:
+          - "clause": نص البند كما هو.
+          - "problem": سبب الغموض.
+          - "recommendation": اقتراح لإعادة صياغته.
+        - تحقق من التواريخ للتأكد من أنها منطقية (مثل أن تكون تواريخ النهاية بعد تواريخ البداية).
+
+        مثال على التنسيق:
+        [
+            {{
+                "clause": "الطرف الأول يلتزم بتوفير الخدمة حسب الظروف المتاحة.",
+                "problem": "غير واضح ما المقصود بـ'الظروف المتاحة'.",
+                "recommendation": "يُحدد نطاق الخدمات ومدى توافرها بدقة."
+            }}
+        ]
+
+        إذا لم توجد بنود غامضة، أعد JSON فارغة مثل: []
+    """
+    try:
+        generation_config = genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.2
+        )
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        analysis_json = response.text.strip()
+        parsed_clauses = json.loads(analysis_json)
+        return parsed_clauses
+    except Exception as e:
+        print(f"Gemini API error or invalid JSON: {e}")
+        return []
+
+# Commit: Add function to analyze contract clauses for contradictions using Gemini, returning JSON with conflicting clauses, contradictions, and recommendations.
+def analyze_contradictory_clauses_with_gemini(clauses):
+    """Analyze contract for contradictory clauses and return structured JSON data directly."""
+    print(f"Analyzing contradictory clauses: {clauses}")
+    prompt = f"""
+        قم بتحليل العقد التالي وتحديد البنود المتناقضة فيه.
+
+        النص:
+        {clauses}
+
+        المطلوب:
+        - قم بإرجاع نتائج التحليل بصيغة JSON فقط، دون أي نصوص إضافية.
+        - لكل مجموعة من البنود المتناقضة، أدرج:
+          - "clause1": نص البند الأول كما هو.
+          - "clause2": نص البند الثاني كما هو (أو فارغ إذا كان التناقض مع نص خارجي).
+          - "contradiction": شرح التناقض بين البندين (أو بين البند ونص خارجي).
+          - "recommendation": اقتراح لتسوية التناقض.
+        - ركز على التناقضات مثل الالتزامات المتناقضة، الحقوق المتباينة، أو الشروط المعارضة.
+        - تحقق من التواريخ للتأكد من أنها منطقية (مثل أن تكون تواريخ النهاية بعد تواريخ البداية). إذا تم العثور على تاريخ غير منطقي، قم بتضمينه كجزء من التناقض.
+
+        مثال على التنسيق:
+        [
+            {{
+                "clause1": "الطرف الأول يلتزم بتسليم العمل خلال 30 يومًا.",
+                "clause2": "الطرف الأول يلتزم بتسليم العمل خلال 60 يومًا.",
+                "contradiction": "البندان يحددان فترتين مختلفتين لتسليم العمل.",
+                "recommendation": "توحيد المدة إلى فترة واحدة، مثل: 'الطرف الأول يلتزم بتسليم العمل خلال 45 يومًا.'"
+            }}
+        ]
+
+        إذا لم توجد بنود متناقضة، أعد JSON فارغة مثل: []
+    """
+    try:
+        generation_config = {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
+        response = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        analysis_json = response.text.strip()
+        parsed_clauses = json.loads(analysis_json)
+        return parsed_clauses
+    except Exception as e:
+        print(f"Gemini API error or invalid JSON for contradictory analysis: {e}")
+        return []
+
+# Commit: Add function to orchestrate PDF processing, clause extraction, and analysis based on contract type (ambiguous or contradictory).
+def process_pdf_and_analyze_clauses(pdf_path, contract_type='ambiguous_contract'):
+    """Process PDF and return clause analysis based on contract type."""
+    extracted_text = process_pdf_with_gemini(pdf_path)
+    extracted_text = correct_dates_in_text(extracted_text)
+    clauses = extract_contract_clauses(extracted_text)
+    if contract_type == 'ambiguous_contract':
+        return analyze_contract_with_gemini(clauses)
+    elif contract_type == 'Contradictory_contract':
+        return analyze_contradictory_clauses_with_gemini(clauses)
+    else:
+        print(f"Invalid contract type: {contract_type}")
+        return []
+
+
+URL Workflow for contract_analyzer_app
+The URL workflow for the contract analysis feature is centered around the /contract/ endpoint, which is defined in the project-level urls.py and delegated to contract_analyzer_app/urls.py. Below is the detailed workflow:
+
+Base URL for Contract Analysis (/contract/):
+Routing: The project-level urls.py maps /contract/ to include("contract_analyzer_app.urls"), which delegates to contract_analyzer_app/urls.py. In contract_analyzer_app/urls.py, the root path ("") is mapped to the upload_pdf view function.
+Behavior:
+GET Request:
+The upload_pdf function renders the contract.html template, which presumably contains a form for uploading a PDF file and selecting a contract type (e.g., ambiguous_contract or Contradictory_contract).
+The form likely includes a file input for the PDF (contractFile) and a field for the contract type (contract-type).
+POST Request:
+The upload_pdf function checks for a valid PDF file in request.FILES['contractFile'] and retrieves the contract type from request.POST['contract-type'] (defaults to ambiguous_contract if not provided).
+Validation: Ensures the uploaded file is a PDF by checking content_type == 'application/pdf'. If not, returns a JSON error response with status 400.
+File Handling: Saves the PDF temporarily to MEDIA_ROOT/temp.pdf using Django’s default_storage.
+Processing: Calls process_pdf_and_analyze_clauses with the file path and contract type to extract text, identify clauses, and analyze them for ambiguity or contradictions.
+Response: Returns a JSON response with the analysis results (list of clauses with issues) or an error message if processing fails (status 500).
+Cleanup: Deletes the temporary PDF file in a finally block to prevent storage accumulation.
+Backend Processing (Services):
+Text Extraction:
+process_pdf_with_gemini calls extract_text_with_gemini, which uploads the PDF to Gemini, extracts text (preserving Arabic, English, numbers, and dates), and deletes the uploaded file from Gemini’s storage.
+Date Validation:
+correct_dates_in_text checks for dates in the format DD-MM-YYYY using a regex pattern and logs any invalid or suspicious dates without modifying the text unless necessary.
+Clause Extraction:
+extract_contract_clauses uses Gemini to identify contract clauses, ignoring non-clause text (e.g., headers, signatures) and formatting clauses as "بند رقم X: [clause text]".
+Clause Analysis:
+If contract_type is ambiguous_contract, analyze_contract_with_gemini analyzes clauses for ambiguity, returning JSON with each ambiguous clause, its problem, and a recommendation.
+If contract_type is Contradictory_contract, analyze_contradictory_clauses_with_gemini analyzes for contradictions, returning JSON with conflicting clauses, the contradiction, and a recommendation.
+Both analysis functions use Gemini with a JSON response format and handle errors by returning an empty list if the API call or JSON parsing fails.
+Orchestration:
+process_pdf_and_analyze_clauses coordinates the process: extracts text, corrects dates, extracts clauses, and performs the appropriate analysis based on the contract type.
+Frontend Interaction:
+The contract.html template (not provided) likely includes a form with a file input for the PDF and a dropdown or input for selecting the contract type.
+When the form is submitted (POST to /contract/), the upload_pdf view processes the request and returns a JSON response.
+The frontend (likely with JavaScript) would handle the JSON response to display the analyzed clauses, their issues, and recommendations, or show error messages if the upload or processing fails.

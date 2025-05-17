@@ -1,0 +1,337 @@
+Explanation of the Codebase
+1. urls.py (Project-level URL Configuration)
+This file defines the top-level URL patterns for the "Mustasharik" Django project. It acts as the entry point for routing HTTP requests to the appropriate apps.
+
+Purpose: Maps URL paths to specific Django apps (app, qa_app, contract_analyzer_app) using the include() function, which delegates URL handling to the respective app's urls.py.
+Key Components:
+path("", include("app.urls")): Routes the root URL (/) to the app application's URL configuration.
+path("qa/", include("qa_app.urls")): Routes URLs starting with /qa/ to the qa_app application's URL configuration.
+path("contract/", include("contract_analyzer_app.urls")): Routes URLs starting with /contract/ to the contract_analyzer_app application's URL configuration.
+
+from datetime import datetime
+from django.urls import path, include
+
+urlpatterns = [
+    path("", include("app.urls")),
+    path("qa/", include("qa_app.urls")),
+    path("contract/", include("contract_analyzer_app.urls")),
+]
+
+
+2. qa_app/urls.py (App-level URL Configuration)
+This file defines URL patterns specific to the qa_app application, which handles question-answering functionality.
+
+Purpose: Maps specific URL paths within the /qa/ namespace to view functions in qa_app.views.
+Key Components:
+app_name = "qa_app": Defines a namespace for the app's URLs to avoid conflicts with other apps.
+path("", views.qa_view, name="qa_view"): Maps /qa/ to the qa_view function, which renders the QA interface.
+path("api/", views.qa_api, name="qa_api"): Maps /qa/api/ to the qa_api function, which handles API requests for answering questions.
+
+from django.urls import path
+from . import views
+app_name = "qa_app"
+urlpatterns = [
+    path("", views.qa_view, name="qa_view"),
+    path("api/", views.qa_api, name="qa_api"),
+]
+
+
+3. qa_app/views.py (View Functions)
+This file contains the view functions that handle HTTP requests and responses for the QA application.
+
+Key Components:
+Logger: Uses Python's logging module to log information and errors.
+QAService: A singleton instance of the QAService class is used to process queries.
+qa_api Function:
+Handles POST requests to /qa/api/.
+Retrieves the query from the request's POST data.
+Calls QAService.answer_question to get an answer and sources.
+Returns a JSON response with the query, answer, and sources, or an error if something fails.
+qa_view Function:
+Handles GET and POST requests to /qa/.
+For GET, renders the question.html template (the QA interface).
+For POST, processes the query using QAService, then renders the template with the query, answer, sources, or an error message.
+
+from django.shortcuts import render
+from django.http import JsonResponse
+from .services import QAService
+import logging
+
+logger = logging.getLogger(__name__)
+qa_service = QAService.get_instance()
+
+# Commit: Add API endpoint for handling question-answering requests via POST, returning JSON with answer and sources.
+def qa_api(request):
+    """API endpoint for QA."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return JsonResponse({"error": "Query is required"}, status=400)
+
+        try:
+            logger.info(f"Processing query: {query}")
+            result = qa_service.answer_question(query)
+            return JsonResponse({
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing API query: {e}", exc_info=True)
+            return JsonResponse({"error": "An error occurred"}, status=500)
+
+    return JsonResponse({"error": "Invalid request method"}, status=405)
+
+# Commit: Add view to render the QA interface, handling both GET (display form) and POST (process query and display results).
+def qa_view(request):
+    """Render the QA interface."""
+    if request.method == "POST":
+        query = request.POST.get("query", "")
+        if not query:
+            return render(request, "qa_app/question.html", {"error": "يرجى إدخال سؤال"})
+
+        try:
+            result = qa_service.answer_question(query)
+            return render(request, "qa_app/question.html", {
+                "query": query,
+                "answer": result["answer"],
+                "sources": result["sources"]
+            })
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            return render(request, "qa_app/question.html", {"error": "حدث خطأ أثناء معالجة السؤال"})
+
+    return render(request, "qa_app/question.html")
+
+
+
+4. qa_app/services.py (QAService Class)
+This file implements the QAService class, which handles the core logic for loading documents, creating a vector store, setting up a retriever, and answering questions using a language model.
+
+Key Components:
+Singleton Pattern: Ensures only one instance of QAService exists using __new__ and __init__.
+Document Loading: Loads .docx files from a directory using Docx2txtLoader.
+Vector Store: Uses Chroma to store document embeddings, created with HuggingFaceEmbeddings.
+Retriever: Uses ContextualCompressionRetriever with a cross-encoder reranker to retrieve relevant documents.
+Language Model: Uses ChatGoogleGenerativeAI (Gemini model) to generate answers.
+QA Chain: Combines the retriever and language model with a prompt template to answer questions and provide sources.
+Methods:
+load_documents: Loads .docx files.
+create_vectorstore: Splits documents into chunks and creates a Chroma vector store.
+load_vectorstore: Loads an existing vector store.
+setup_retriever: Configures the retriever with reranking.
+setup_llm: Initializes the language model.
+create_qa_chain: Builds the QA chain.
+_initialize_system: Initializes the system by creating or loading the vector store and setting up the retriever and QA chain.
+answer_question: Processes a query and returns an answer with sources.
+
+import os
+import glob
+import logging
+from langchain_community.document_loaders import Docx2txtLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from django.conf import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Configuration
+DOCUMENTS_DIRECTORY = os.path.join(settings.BASE_DIR, "legal_documents")
+PERSIST_DIRECTORY = os.path.join(settings.BASE_DIR, "chroma_db")
+GOOGLE_API_KEY = settings.GOOGLE_API_KEY
+
+class QAService:
+    _instance = None
+
+    def __new__(cls, force_reinitialize=False):
+        if cls._instance is None:
+            cls._instance = super(QAService, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, force_reinitialize=False):
+        if not self._initialized:
+            self.embeddings = HuggingFaceEmbeddings(model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1")
+            self.qa_chain, self.retriever = self._initialize_system(force_reinitialize)
+            self._initialized = True
+
+    # Commit: Add method to load all .docx files from a specified directory for processing.
+    def load_documents(self, directory):
+        """Load all .docx files from the specified directory."""
+        docs = []
+        for file_path in glob.glob(os.path.join(directory, "*.docx")):
+            try:
+                loader = Docx2txtLoader(file_path)
+                docs.extend(loader.load())
+                logging.info(f"Successfully loaded {file_path}")
+            except Exception as e:
+                logging.error(f"Error loading {file_path}: {e}")
+        if not docs:
+            raise ValueError("No valid Word documents found in the directory.")
+        return docs
+
+    # Commit: Add method to create a Chroma vector store from documents, splitting them into chunks and persisting to disk.
+    def create_vectorstore(self, docs):
+        """Create a Chroma vector store from the provided documents."""
+        splitter = SemanticChunker(self.embeddings)
+        chunks = splitter.split_documents(docs)
+        logging.info("Documents split into chunks successfully.")
+        vectorstore = Chroma.from_documents(chunks, self.embeddings, persist_directory=PERSIST_DIRECTORY)
+        vectorstore.persist()
+        logging.info("Vector store created and persisted.")
+        return vectorstore
+
+    # Commit: Add method to load an existing Chroma vector store from disk for reuse.
+    def load_vectorstore(self):
+        """Load an existing Chroma vector store from disk."""
+        if not os.path.exists(PERSIST_DIRECTORY):
+            raise FileNotFoundError(f"No vector store found at {PERSIST_DIRECTORY}. Please initialize it first.")
+        vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=self.embeddings)
+        logging.info("Vector store loaded from disk.")
+        return vectorstore
+
+    # Commit: Add method to set up a retriever with cross-encoder reranking for improved document relevance.
+    def setup_retriever(self, vectorstore):
+        """Set up the retriever with cross-encoder reranking."""
+        cross_encoder = HuggingFaceCrossEncoder(model_name="Omartificial-Intelligence-Space/ARA-Reranker-V1")
+        compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
+        compression_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor,
+            base_retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
+        )
+        logging.info("Retriever set up with cross-encoder reranking.")
+        return compression_retriever
+
+    # Commit: Add method to initialize the Google Gemini language model for answering questions.
+    def setup_llm(self):
+        """Set up the language model."""
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.7,
+            max_output_tokens=256
+        )
+        logging.info("Language model initialized.")
+        return llm
+
+    # Commit: Add method to create a QA chain with a prompt template and source citation support.
+    def create_qa_chain(self, retriever, llm):
+        """Create the QA chain with citation support."""
+        template = """
+        You are an intelligent assistant that answers questions in clear, concise Arabic.
+        Context: {context}
+        Question: {query}
+        Please cite the source(s) of the information in your response.
+        Answer:
+        """
+        prompt = ChatPromptTemplate.from_template(template)
+        output_parser = StrOutputParser()
+
+        def format_context(docs):
+            """Format context and extract source metadata."""
+            context = "\n\n".join(doc.page_content for doc in docs)
+            sources = [doc.metadata.get('source', 'Unknown') for doc in docs]
+            return {"context": context, "sources": sources}
+
+        qa_chain = (
+            {"context": retriever | format_context, "query": RunnablePassthrough()}
+            | RunnablePassthrough.assign(
+                answer=prompt | llm | output_parser
+            )
+        )
+        logging.info("QA chain created.")
+        return qa_chain
+
+    # Commit: Add method to initialize the QA system, handling vector store creation or loading, retriever setup, and QA chain creation.
+    def _initialize_system(self, force_reinitialize):
+        """Initialize the system by loading or creating the vector store."""
+        if force_reinitialize or not os.path.exists(PERSIST_DIRECTORY):
+            logging.info("Initializing system from scratch...")
+            docs = self.load_documents(DOCUMENTS_DIRECTORY)
+            vectorstore = self.create_vectorstore(docs)
+        else:
+            logging.info("Loading existing vector store...")
+            vectorstore = self.load_vectorstore()
+
+        retriever = self.setup_retriever(vectorstore)
+        llm = self.setup_llm()
+        qa_chain = self.create_qa_chain(retriever, llm)
+        return qa_chain, retriever
+
+    # Commit: Add method to answer a question using the QA chain, returning the answer and sources.
+    def answer_question(self, query):
+        """Answer a question using the QA chain and return answer with sources."""
+        try:
+            result = self.qa_chain.invoke(query)
+            return {
+                "answer": result["answer"],
+                "sources": result["context"]["sources"]
+            }
+        except Exception as e:
+            logging.error(f"Error answering question: {e}", exc_info=True)
+            raise
+
+    @classmethod
+    # Commit: Add class method to retrieve the singleton instance of QAService.
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = QAService()
+        return cls._instance
+
+
+
+5. qa_app/templates/qa_app/question.html (Frontend Template)
+This template defines the QA interface, including a form for submitting queries and a container for displaying results.
+
+Key Components:
+HTML:
+Extends layout.html for consistent styling.
+Contains a form with a textarea for user queries and a submit button.
+Displays results in a results-container div.
+JavaScript:
+Prevents default form submission and uses AJAX to send queries to the /qa/api/ endpoint.
+Displays user queries, answers, and sources in the results-container.
+Includes a toggle button to show/hide sources.
+CSS:
+Styles the results container, user messages, AI responses, errors, and source toggle button.
+
+
+
+Workflow of URLs
+The URL structure in this Django application determines how user requests are routed to the appropriate view functions and processed. Below is the detailed workflow, starting from the base URL:
+
+Base URL (/):
+Routing: The project-level urls.py maps the root URL ("") to include("app.urls"). This delegates all requests to the root path to the app application's URL configuration.
+Behavior: The exact behavior depends on app.urls, which is not provided here. Typically, it would render a homepage or a default view for the application.
+QA URL (/qa/):
+Routing: The project-level urls.py maps /qa/ to include("qa_app.urls"), which delegates to qa_app/urls.py.
+Sub-routes:
+/qa/:
+Maps to qa_view in qa_app.views.
+GET Request: Renders the question.html template, displaying a form where users can input a query.
+POST Request: Processes the query using QAService.answer_question, then re-renders question.html with the query, answer, and sources (or an error if the query is empty or fails).
+/qa/api/:
+Maps to qa_api in qa_app.views.
+POST Request: Expects a query in the POST data, processes it using QAService.answer_question, and returns a JSON response with the query, answer, and sources. If the request method is not POST or the query is empty, it returns an error JSON response.
+Used by: The JavaScript in question.html sends AJAX requests to this endpoint when the form is submitted, allowing dynamic updates to the results container without reloading the page.
+Contract URL (/contract/):
+Routing: The project-level urls.py maps /contract/ to include("contract_analyzer_app.urls"), delegating to the contract_analyzer_app application's URL configuration.
+Behavior: The exact behavior depends on contract_analyzer_app.urls, which is not provided here. It likely handles contract-related functionality.
+Frontend Interaction:
+When a user visits /qa/, the qa_view function renders question.html, showing a form.
+Submitting the form triggers JavaScript in question.html to send an AJAX POST request to /qa/api/ with the query.
+The qa_api view processes the query and returns a JSON response.
+The JavaScript updates the results-container with the user's query, the AI's answer, and a button to toggle the visibility of sources.
+Backend Processing (QAService):
+The QAService singleton initializes by loading .docx files from legal_documents or using an existing Chroma vector store in chroma_db.
+It splits documents into chunks, creates embeddings using HuggingFaceEmbeddings, and stores them in Chroma.
+The retriever uses a cross-encoder reranker to select the top 3 relevant document chunks for a query.

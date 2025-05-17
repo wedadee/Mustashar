@@ -1,0 +1,63 @@
+# Django-specific
+*.pyc
+*.pyo
+__pycache__/
+.DS_Store
+.idea/
+.vscode/
+*.log
+local_settings.py  # Or your local settings file name
+db.sqlite3  # Or your local database file
+media/  # If you're not tracking media files in Git
+staticfiles/  # If you're using a separate process to manage static files
+env/  # If you're using a virtual environment
+.vs/
+# General Python
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+*.egg
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+
+# Python Test Coverage
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+cover/
+htmlcov/
+
+# Django Test Runner
+.pytest_cache/
+
+# IPython Notebook
+.ipynb_checkpoints
+
+# Django Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Django Debug Toolbar
+*.sqlite3-journal
+
+# Django Admin
+*.sqlite3-journal
+
+# Virtualenv
+.venv/
+
+# PyCharm
+*.idea/
+
+# Visual Studio Code
+.vscode/
+
+# macOS
+.DS_Store

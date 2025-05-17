@@ -1,0 +1,96 @@
+{% extends "layout.html" %}
+{% load static %}
+{% block content %}
+<div class="container contract-page py-5" dir="rtl">
+    <div class="row g-4">
+        <div class="col-md-5">
+            <form id="contract-form" method="post" enctype="multipart/form-data">
+                {% csrf_token %}
+                <div class="mt-2 mb-4">
+                    <label for="contract-type " class="form-label fw-bold mb-3">أداة التحقق</label>
+                    <select class="form-select" id="contract-type" name="contract-type">
+                        <option value="ambiguous_contract" selected>البنود الغامضة</option>
+                        <option value="Contradictory_contract">البنود المتناقضة</option>
+                    </select>
+                </div>
+                <div class="mb-5">
+                    <label for="contractFile" class="form-label fw-bold mb-3">ملف الوثيقة</label>
+                    <input class="form-control" id="contractFile" name="contractFile" type="file" accept=".pdf">
+                </div>
+                <button type="submit" class="btn btn-primary w-100 main-btn mb-5">مراجعة</button>
+            </form>
+        </div>
+        <div class="col-md-7">
+            <h5 class="mb-3 fw-bold">نتيجة المراجعة</h5>
+            <div class="results-container p-4">
+                <!-- Results will be dynamically populated here -->
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    $(document).ready(function () {
+        $('#contract-form').on('submit', function (e) {
+            e.preventDefault();
+            var formData = new FormData(this);
+            var contractType = $('#contract-type').val();
+            $('.results-container').html('<p class="text-muted">جاري المعالجة...</p>');
+
+            $.ajax({
+                url: "{% url 'contract-view' %}",
+                type: "POST",
+                data: formData,
+                processData: false,
+                contentType: false,
+                success: function (response) {
+                    $('.results-container').empty();
+                    if (response.error) {
+                        $('.results-container').html(
+                            `<div class="alert alert-danger" role="alert">
+                                خطأ: ${response.error}<br>التفاصيل: ${response.details || 'غير متوفرة'}
+                            </div>`
+                        );
+                    } else {
+                       
+                            $.each(response.clauses, function (index, item) {
+                                var clauseHtml = '';
+                                if (contractType === 'ambiguous_contract') {
+                                    clauseHtml = `
+                                        <div class="clause-card">
+                                            <h6>البند ${index + 1}</h6>
+                                            <p><strong>نص البند:</strong> ${item.clause}</p>
+                                            <p><strong>المشكلة:</strong> ${item.problem}</p>
+                                            <p><strong>التوصية:</strong> ${item.recommendation}</p>
+                                        </div>
+                                    `;
+                                } else if (contractType === 'Contradictory_contract') {
+                                    clauseHtml = `
+                                        <div class="clause-card">
+                                            <h6>التناقض ${index + 1}</h6>
+                                            <p><strong>البند الأول:</strong> ${item.clause1}</p>
+                                            <p><strong>البند الثاني:</strong> ${item.clause2 || 'غير متوفر'}</p>
+                                            <p><strong>التناقض:</strong> ${item.contradiction}</p>
+                                            <p><strong>التوصية:</strong> ${item.recommendation}</p>
+                                        </div>
+                                    `;
+                                }
+                                $('.results-container').append(clauseHtml);
+                            });
+                        
+                    }
+                },
+                error: function (xhr, status, error) {
+                    $('.results-container').html(
+                        `<div class="alert alert-danger" role="alert">
+                            حدث خطأ أثناء المعالجة: ${error}
+                        </div>`
+                    );
+                }
+            });
+        });
+    });
+</script>
+{% endblock %}

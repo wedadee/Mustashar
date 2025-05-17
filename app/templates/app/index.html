@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+    {% load static %}
+{% block content %}
+<!-- landing section -->
+<div class="landing d-flex justify-content-center align-items-center pb-4 pt-sm-5">
+    <!-- Use Bootstrap Grid System -->
+    <div class="container">
+        <div class="row align-items-center">
+            <!-- Column for Text -->
+            <div class="col-md-6 text-center">
+                <h1 class="landing-header">مستشارك</h1>
+                <h3 class="landing-header">   وجهتك الاولى لاستشارة امنة</h3>
+                <p class="text-black-50 landing-description mt-3 mb-4">
+                    مستشارك منصة قانونية رائدة في تحليل العقود والإجابة عن أسئلتكم القانونية.
+                </p>
+
+            </div>
+            <!-- Column for Image -->
+            <div class="col-md-6 d-flex justify-content-center align-items-center">
+                <img src="{% static 'imgs/main-image-4.png' %}" class="img-fluid main-img mt-3" alt="Main Image" style="max-width: 80%;">
+            </div>
+        </div>
+    </div>
+</div>
+
+
+
+{% endblock %}

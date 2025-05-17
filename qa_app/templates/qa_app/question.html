@@ -1,0 +1,198 @@
+{% extends "layout.html" %}
+{% load static %}
+
+{% block content %}
+<div class="container contract-page mt-5">
+    <div class="row">
+        <div class="col-md-5 p-2 bd-highlight">
+            <form id="chat-form" method="post" enctype="multipart/form-data">
+                {% csrf_token %}
+                <div class="mb-5">
+                    <textarea id="chat-input" name="query" class="form-control" placeholder="اكتب استفسارك هنا ..." rows="8"></textarea>
+                </div>
+                <div class="mb-3">
+                    <button type="submit" class="btn btn-md btn-primary main-btn w-100">ارسال</button>
+                </div>
+            </form>
+        </div>
+        <div class="col-md-7 d-flex flex-column my-2 px-2">
+            <div id="results-container" class="results-container p-3 ms-md-5 flex-grow-1 text-black-50 bd-highlight">
+                <!-- Chat messages will appear here -->
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.getElementById('chat-form').addEventListener('submit', function (e) {
+        e.preventDefault(); // Prevent form submission
+
+        const userInput = document.getElementById('chat-input').value.trim();
+        const resultsContainer = document.getElementById('results-container');
+
+        if (!userInput) {
+            resultsContainer.innerHTML += '<div class="error">يرجى إدخال سؤال</div>';
+            resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            return;
+        }
+
+        // Add user's message to the results container
+        resultsContainer.innerHTML += `<div class="user-message">${userInput}</div>`;
+
+        // Clear the input field
+        document.getElementById('chat-input').value = '';
+
+        // Show loading indicator
+        const loadingDiv = document.createElement('div');
+        loadingDiv.id = 'loading';
+        loadingDiv.innerText = 'جاري المعالجة...';
+        resultsContainer.appendChild(loadingDiv);
+        resultsContainer.scrollTop = resultsContainer.scrollHeight;
+
+        // Send AJAX request
+        fetch('{% url "qa_app:qa_api" %}', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-CSRFToken': document.querySelector('input[name=csrfmiddlewaretoken]').value
+            },
+            body: `query=${encodeURIComponent(userInput)}`
+        })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Remove loading indicator
+                loadingDiv.remove();
+
+                if (data.answer) {
+                    // Create a unique ID for this answer's sources
+                    const sourceId = 'sources-' + Date.now();
+
+                    // Post-process sources: Transform local paths to media URLs and remove duplicates
+                    const processedSources = [];
+                    const seenSources = new Set();
+                    if (data.sources && data.sources.length > 0) {
+                        data.sources.forEach(source => {
+                            // Extract filename from the path (works for both Windows and Unix paths)
+                            const filename = source.split(/[\\/]/).pop();
+                            // Construct media URL
+                            const mediaUrl = `/media/legal_documents/${filename}`;
+                            if (!seenSources.has(filename)) {
+                                seenSources.add(filename);
+                                processedSources.push(mediaUrl);
+                            }
+                        });
+                    }
+
+                    // Add answer with a button to show sources
+                    resultsContainer.innerHTML += `
+                        <div class="gpt-response">
+                            ${data.answer}
+                            <button class="source-btn" data-source-id="${sourceId}">عرض المصادر</button>
+                            <div class="sources" id="${sourceId}" style="display: none;">
+                                ${processedSources.length > 0
+                            ? processedSources.map((source, index) => `<div><a href="${source}" target="_blank" download>مصدر ${index + 1}</a></div>`).join('')
+                            : '<div>لا توجد مصادر متاحة</div>'}
+                            </div>
+                        </div>`;
+
+                    // Add event listener for the source button
+                    document.querySelector(`button[data-source-id="${sourceId}"]`).addEventListener('click', function () {
+                        const sourceDiv = document.getElementById(sourceId);
+                        sourceDiv.style.display = sourceDiv.style.display === 'none' ? 'block' : 'none';
+                    });
+                } else {
+                    resultsContainer.innerHTML += '<div class="error">خطأ: تعذر الحصول على إجابة</div>';
+                }
+                // Scroll to the bottom
+                resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            })
+            .catch(error => {
+                // Remove loading indicator
+                loadingDiv.remove();
+
+                console.error('Error:', error);
+                resultsContainer.innerHTML += `<div class="error">خطأ في الاتصال بالخادم: ${error.message}</div>`;
+                resultsContainer.scrollTop = resultsContainer.scrollHeight;
+            });
+    });
+</script>
+
+<style>
+    .results-container {
+        max-height: 400px;
+        overflow-y: auto;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+    }
+
+    .user-message {
+        background-color: #e1f5fe;
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+        text-align: right;
+    }
+
+    .gpt-response {
+        background-color: #f0f0f0;
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+        text-align: right;
+    }
+
+    .error {
+        color: red;
+        padding: 10px;
+        margin: 5px;
+        text-align: right;
+    }
+
+    #loading {
+        color: #888;
+        padding: 10px;
+        margin: 5px;
+        text-align: center;
+    }
+
+    .source-btn {
+        background-color: #007bff;
+        color: white;
+        border: none;
+        padding: 5px 10px;
+        margin-top: 10px;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 14px;
+    }
+
+        .source-btn:hover {
+            background-color: #0056b3;
+        }
+
+    .sources {
+        background-color: #ffffff;
+        border: 1px solid #ddd;
+        padding: 10px;
+        margin-top: 10px;
+        border-radius: 3px;
+        text-align: right;
+    }
+
+        .sources a {
+            color: #007bff;
+            text-decoration: none;
+        }
+
+            .sources a:hover {
+                text-decoration: underline;
+            }
+</style>
+{% endblock %}
